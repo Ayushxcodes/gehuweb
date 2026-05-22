@@ -164,8 +164,4 @@ export default function AdminFeedbackPage() {
     </>
   );
 }
-import React from 'react';
 
-export default function AdminFeedbackPage() {
-  return <div className="p-6">Admin Feedback (placeholder)</div>;
-}
