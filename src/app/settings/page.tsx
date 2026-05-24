@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { Settings as SettingsIcon, User, Shield, Moon } from 'lucide-react';
-import { useAuth } from '../../providers/AuthProvider';
+import { useAuth } from '../providers/AuthProvider';
 
 export default function SettingsPage() {
   const { user } = useAuth();
@@ -33,9 +33,4 @@ export default function SettingsPage() {
       </div>
     </>
   );
-}
-import React from 'react';
-
-export default function SettingsPage() {
-  return <div className="p-6">Settings (placeholder)</div>;
 }

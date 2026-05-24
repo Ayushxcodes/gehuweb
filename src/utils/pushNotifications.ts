@@ -41,8 +41,9 @@ const getDeviceId = () => {
   if (typeof window === 'undefined') return null;
   let value = localStorage.getItem(key);
   if (!value) {
-    value = (crypto as any).randomUUID ? (crypto as any).randomUUID() : Math.random().toString(36).slice(2);
-    localStorage.setItem(key, value);
+    const generated = (crypto as any).randomUUID ? (crypto as any).randomUUID() : Math.random().toString(36).slice(2);
+    localStorage.setItem(key, generated);
+    value = generated;
   }
   return value;
 };
