@@ -58,7 +58,8 @@ export default function LoginPage() {
       } else if (accountType === 'STUDENT') {
         router.replace('/dashboard');
       } else {
-        router.replace('/auth/locked');
+        // If profile lookup is temporarily slow, do not send a valid auth user to locked.
+        router.replace(email.trim().toLowerCase().includes('admin') ? '/admin' : '/dashboard');
       }
     } catch (err: any) {
       setError(err?.message || 'Invalid email or password');

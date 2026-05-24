@@ -1,0 +1,2 @@
+Redis: type of temp storage middle men
+

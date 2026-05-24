@@ -6,7 +6,8 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 export const customFetch = async (input: RequestInfo, init?: RequestInit) => {
   const controller = new AbortController();
   const timeoutMs = 30000; // 30s
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(new DOMException('Request timeout', 'TimeoutError')), timeoutMs);
+  const externalSignal = init?.signal;
 
   const getInputUrl = (inp: RequestInfo) => {
     try {
@@ -19,18 +20,34 @@ export const customFetch = async (input: RequestInfo, init?: RequestInit) => {
     }
   };
 
+  const abortFromExternalSignal = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(externalSignal?.reason);
+    }
+  };
+
+  if (externalSignal?.aborted) {
+    abortFromExternalSignal();
+  } else {
+    externalSignal?.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
+
   try {
     const response = await fetch(input, { ...init, signal: controller.signal });
     return response;
   } catch (error: any) {
     const requestUrl = getInputUrl(input);
-    if (error?.name === 'AbortError') {
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+      if (externalSignal?.aborted) {
+        throw error;
+      }
       throw new Error(`Network request to ${requestUrl} timed out after ${timeoutMs / 1000} seconds. Please check your connection.`);
     }
     const message = error?.message || String(error);
     throw new Error(`Fetch to ${requestUrl} failed: ${message}`);
   } finally {
     clearTimeout(timeoutId);
+    externalSignal?.removeEventListener('abort', abortFromExternalSignal);
   }
 };
 

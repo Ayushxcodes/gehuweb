@@ -43,20 +43,20 @@ export default function Sidebar() {
   const studentLinks: any[] = [
     { section: 'Core' },
     { to: '/student/dashboard', icon: LayoutDashboard, label: 'Home', end: true },
-    { to: '/notifications', icon: Bell, label: 'Notifications', badge: bellCount },
-    { to: '/mail', icon: Mail, label: 'Mail' },
+    { to: '/student/notifications', icon: Bell, label: 'Notifications', badge: bellCount },
+    { to: '/student/mail', icon: Mail, label: 'Mail' },
 
     { section: 'Academics' },
-    { to: '/mock-tests', icon: ClipboardList, label: 'Mock Test' },
-    { to: '/practice', icon: BookOpen, label: 'Practice' },
-    { to: '/results', icon: Trophy, label: 'Result' },
-    { to: '/notices', icon: FileText, label: 'Notice Board' },
+    { to: '/student/mock-tests', icon: ClipboardList, label: 'Mock Test' },
+    { to: '/student/practice', icon: BookOpen, label: 'Practice' },
+    { to: '/student/results', icon: Trophy, label: 'Result' },
+    { to: '/student/notices', icon: FileText, label: 'Notice Board' },
 
     { section: 'Career & Events' },
-    { to: '/events', icon: Calendar, label: 'Events' },
-    { to: '/achievements', icon: Award, label: 'Achievements' },
-    { to: '/resume', icon: Briefcase, label: 'Resume' },
-    { to: '/feedback', icon: MessageSquare, label: 'Resume Feedback' },
+    { to: '/student/events', icon: Calendar, label: 'Events' },
+    { to: '/student/achievements', icon: Award, label: 'Achievements' },
+    { to: '/student/resume', icon: Briefcase, label: 'Resume' },
+    { to: '/student/feedback', icon: MessageSquare, label: 'Resume Feedback' },
   ];
 
   const adminLinks: any[] = [

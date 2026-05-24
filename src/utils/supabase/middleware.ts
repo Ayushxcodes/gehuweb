@@ -4,8 +4,7 @@ import { createServerSupabaseClient } from './server';
 // Usage example in middleware.ts (root):
 // const { data } = await getSessionFromHeaders(request.headers);
 export async function getSessionFromHeaders(headers: Headers) {
-  const cookie = headers.get('cookie') || undefined;
-  const supabase = createServerSupabaseClient(cookie);
+  const supabase = await createServerSupabaseClient();
   try {
     const session = await supabase.auth.getSession();
     return session;

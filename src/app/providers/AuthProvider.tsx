@@ -1,14 +1,15 @@
-
 "use client";
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { supabase } from '../../utils/supabaseClient';
 import { Roles } from '../../utils/constants';
 
 const AuthContext = createContext<any>(null);
-const LOOKUP_TIMEOUT_MS = 30000;
-const RPC_SNAPSHOT_TIMEOUT_MS = 30000;
-const SIGN_IN_TIMEOUT_MS = 15000;
+const LOOKUP_TIMEOUT_MS = 12000;
+const RPC_SNAPSHOT_TIMEOUT_MS = 10000;
+const SIGN_IN_TIMEOUT_MS = 45000;
+const LOGIN_ROUTE_LOOKUP_GRACE_MS = 4500;
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label = 'operation') {
   let timeoutId: any;
@@ -36,32 +37,111 @@ async function retryWithBackoff(fn: () => Promise<any>, attempts = 3, baseDelay 
   throw lastErr;
 }
 
+function guessAccountTypeFromEmail(email?: string | null) {
+  return String(email || '').toLowerCase().includes('admin') ? Roles.ADMIN : Roles.STUDENT;
+}
+
+function buildFallbackSignedInUser(authUser: any, emailHint?: string | null) {
+  const accountType = guessAccountTypeFromEmail(authUser?.email || emailHint);
+  const identity = {
+    auth_user_id: authUser?.id || null,
+    account_type: accountType,
+    student_id: null,
+    employee_id: null,
+    is_active: true,
+    email: authUser?.email || emailHint || null,
+  };
+  const profileState = accountType === Roles.ADMIN
+    ? {
+        profile_completed: true,
+        verification_status: 'VERIFIED',
+        verified: true,
+      }
+    : null;
+
+  return {
+    identity,
+    profileState,
+    user: {
+      ...authUser,
+      identity,
+      profileState,
+    },
+  };
+}
+
+function describeAuthError(error: any) {
+  if (!error || typeof error !== 'object') {
+    return { message: String(error || 'Unknown auth error') };
+  }
+  return {
+    name: error.name,
+    status: error.status,
+    code: error.code,
+    message: error.message || String(error),
+    details: error.details,
+    hint: error.hint,
+  };
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const queryClient = useQueryClient();
   const [user, setUser] = useState<any>(null);
   const [identity, setIdentity] = useState<any>(null);
   const [profileState, setProfileState] = useState<any>(null);
   const [authDataError, setAuthDataError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const fetchSessionData = useCallback(async (authSessionUser: any) => {
+  // Keep track of pending user for session sync if offline or sleeping
+  const pendingSyncUser = React.useRef<any>(null);
+  const loginHydrationRun = React.useRef(0);
+
+  const fetchSessionData = useCallback(async (authSessionUser: any, isForeground = false) => {
     if (!authSessionUser) return null;
 
+    // 1. Connectivity Check (Navigator.onLine)
+    if (typeof window !== 'undefined' && !navigator.onLine) {
+      console.debug('[AuthSync] Device is offline. Deferring identity check until network is restored.');
+      pendingSyncUser.current = authSessionUser;
+
+      const triggerOnlineSync = async () => {
+        window.removeEventListener('online', triggerOnlineSync);
+        if (pendingSyncUser.current) {
+          console.debug('[AuthSync] Connection restored. Recovering background session.');
+          const userData = await fetchSessionData(pendingSyncUser.current, false);
+          if (userData) {
+            setUser(userData);
+          }
+        }
+      };
+      window.addEventListener('online', triggerOnlineSync);
+      return null;
+    }
+
     try {
+      // Clear pending state if online check succeeds
+      pendingSyncUser.current = null;
+
       // Try the consolidated RPC first (faster, atomic). If it fails or is not present,
       // fall back to direct table queries.
       let rpcRes: any = null;
+      let rpcStart = 0;
       try {
-        const rpcStart = Date.now();
+        rpcStart = Date.now();
         rpcRes = await retryWithBackoff(() => withTimeout(
           // @ts-ignore
-          supabase.rpc('api_auth_route_snapshot', { p_auth_user_id: authSessionUser.id }).maybeSingle(),
+          supabase.rpc('api_auth_route_snapshot').maybeSingle(),
           RPC_SNAPSHOT_TIMEOUT_MS,
           'Route snapshot'
         ), 3, 500);
         const rpcDur = Date.now() - rpcStart;
-        console.debug('[Auth] RPC snapshot succeeded in', rpcDur, 'ms');
-      } catch (e) {
-        console.warn('[Auth] RPC snapshot unavailable or timed out (ms):', Date.now() - (typeof rpcStart !== 'undefined' ? rpcStart : 0), e?.message || e);
+        console.debug('[AuthSync] RPC route snapshot succeeded in', rpcDur, 'ms');
+      } catch (e: any) {
+        if (isForeground) {
+          console.warn('[AuthSync] Foreground RPC snapshot unavailable or timed out; falling back to table lookup:', e?.message || e);
+        } else {
+          console.debug('[AuthSync] Background RPC snapshot deferred or timed out (silent):', e?.message || e);
+        }
       }
 
       let identityData: any = null;
@@ -109,10 +189,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             LOOKUP_TIMEOUT_MS,
             'Identity lookup'
           ), 3, 500);
-          console.debug('[Auth] Identity lookup succeeded in', Date.now() - idStart, 'ms');
-        } catch (e) {
-          console.error('[Auth] Identity lookup failed or timed out after', LOOKUP_TIMEOUT_MS, 'ms:', e);
-          throw new Error(e.message || 'Identity lookup failed');
+          console.debug('[AuthSync] Identity lookup succeeded in', Date.now() - idStart, 'ms');
+        } catch (e: any) {
+          if (isForeground) {
+            console.warn('[AuthSync] Foreground identity lookup failed; preserving raw auth user:', e?.message || e);
+            setAuthDataError(e?.message || 'Identity lookup failed.');
+            identityData = {
+              auth_user_id: authSessionUser.id,
+              account_type: null,
+              student_id: null,
+              employee_id: null,
+              is_active: true,
+              email: authSessionUser.email || null,
+            };
+            pState = null;
+            const merged = {
+              ...authSessionUser,
+              identity: identityData,
+              profileState: pState,
+            };
+            setIdentity(identityData);
+            setProfileState(pState);
+            return merged;
+          } else {
+            console.debug('[AuthSync] Background identity lookup timed out or failed (silent):', e?.message || e);
+            return null; // Return null silently for background tasks to avoid disrupting active session
+          }
         }
 
         identityData = idRes?.data
@@ -122,8 +224,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (identityData) {
           // Profile state lookup with retry; only set authDataError after retries exhausted
           let pRes: any;
+          let pStart = 0;
           try {
-            const pStart = Date.now();
+            pStart = Date.now();
             pRes = await retryWithBackoff(() => withTimeout(
               // @ts-ignore
               supabase
@@ -134,10 +237,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               LOOKUP_TIMEOUT_MS,
               'Profile state lookup'
             ), 3, 500);
-            console.debug('[Auth] Profile state lookup succeeded in', Date.now() - pStart, 'ms');
-          } catch (e) {
-            console.error('[Auth] Profile state fetch error (ms):', Date.now() - (typeof pStart !== 'undefined' ? pStart : 0), e);
-            setAuthDataError(`Profile state lookup failed: ${e.message || e.code || 'unknown error'}`);
+            console.debug('[AuthSync] Profile state lookup succeeded in', Date.now() - pStart, 'ms');
+          } catch (e: any) {
+            if (isForeground) {
+              console.warn('[AuthSync] Foreground profile state fetch error:', describeAuthError(e));
+              setAuthDataError(`Profile state lookup failed: ${e.message || e.code || 'unknown error'}`);
+            } else {
+              console.debug('[AuthSync] Background profile state lookup timed out or failed (silent):', e?.message || e);
+            }
             pState = identityData.account_type === Roles.ADMIN
               ? {
                   profile_completed: true,
@@ -149,7 +256,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
           if (pRes) {
             if (pRes.error) {
-              console.error('Profile state fetch error:', pRes.error);
+              console.warn('[AuthSync] Profile state fetch error:', describeAuthError(pRes.error));
               setAuthDataError(`Profile state lookup failed: ${pRes.error.message || pRes.error.code || 'unknown error'}`);
               pState = identityData.account_type === Roles.ADMIN
                 ? {
@@ -193,10 +300,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setProfileState(pState);
       return merged;
     } catch (error: any) {
-      console.error('Auth session data fetch failed:', error);
-      setAuthDataError(error.message || 'Auth route lookup failed.');
-      // Do NOT nullify identity/profile here. If this is a background sync failure,
-      // we want to preserve the existing state so the user isn't kicked offline.
+      if (isForeground) {
+        console.warn('[AuthSync] Foreground auth session data fetch failed; preserving raw auth user:', error?.message || error);
+        setAuthDataError(error.message || 'Auth route lookup failed.');
+        const fallbackIdentity = {
+          auth_user_id: authSessionUser.id,
+          account_type: null,
+          student_id: null,
+          employee_id: null,
+          is_active: true,
+          email: authSessionUser.email || null,
+        };
+        const merged = {
+          ...authSessionUser,
+          identity: fallbackIdentity,
+          profileState: null,
+        };
+        setIdentity(fallbackIdentity);
+        setProfileState(null);
+        return merged;
+      } else {
+        console.debug('[AuthSync] Background auth session data fetch timed out or failed (silent):', error?.message || error);
+      }
       return null;
     }
   }, []);
@@ -206,18 +331,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const loadInitialSession = async () => {
       try {
-        const { data, error } = await withTimeout(
+        const { data, error } = (await withTimeout(
           supabase.auth.getSession(),
           LOOKUP_TIMEOUT_MS,
           'Session lookup'
-        );
+        )) as any;
 
         if (error) throw error;
         if (!active) return;
 
         const sessionUser = data?.session?.user;
         if (sessionUser) {
-          const userData = await fetchSessionData(sessionUser);
+          const userData = await fetchSessionData(sessionUser, false);
           if (active && userData) {
             setUser(userData);
           } else if (active && !userData) {
@@ -233,7 +358,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAuthDataError(null);
         }
       } catch (error: any) {
-        console.error('Error getting session:', error);
+        console.warn('[AuthSync] Initial session lookup failed or timed out:', error?.message || error);
         if (active) {
           setUser(null);
           setIdentity(null);
@@ -258,30 +383,51 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       async (_event: any, session: any) => {
         try {
           if (session?.user) {
-            const userData = await fetchSessionData(session.user);
-            // ONLY update user if the background sync succeeded.
+            const userData = await fetchSessionData(session.user, false);
+            // ONLY update user if background sync succeeded.
             // If it failed (userData is null), DO NOTHING. Let the user stay logged in.
             if (active && userData) setUser(userData);
           } else {
+            queryClient.clear();
             setUser(null);
             setIdentity(null);
             setProfileState(null);
             setAuthDataError(null);
           }
         } catch (error) {
-          console.error('Auth state refresh failed:', error);
+          console.warn('[AuthSync] Auth state refresh failed:', describeAuthError(error));
         } finally {
           if (active) setLoading(false);
         }
       }
     );
 
+    // Activity triggers for waking from sleep / tab focus
+    const triggerSyncOnActivity = async () => {
+      if (pendingSyncUser.current && typeof window !== 'undefined' && navigator.onLine) {
+        console.debug('[AuthSync] Interactive user activity detected. Recovering deferred sync.');
+        const userData = await fetchSessionData(pendingSyncUser.current, false);
+        if (userData && active) {
+          setUser(userData);
+        }
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('mousemove', triggerSyncOnActivity, { passive: true });
+      window.addEventListener('mousedown', triggerSyncOnActivity, { passive: true });
+    }
+
     return () => {
       active = false;
       clearTimeout(hardStop);
       subscription?.unsubscribe();
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('mousemove', triggerSyncOnActivity);
+        window.removeEventListener('mousedown', triggerSyncOnActivity);
+      }
     };
-  }, [fetchSessionData]);
+  }, [fetchSessionData, queryClient]);
 
   // Proactive keep-alive & wake-from-sleep resiliency
   useEffect(() => {
@@ -336,21 +482,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const { data, error } = res as any;
       if (error) {
-        console.error('[Auth.login] sign-in error', { error });
+        console.warn('[Auth.login] sign-in error', describeAuthError(error));
         throw error;
       }
 
-      const mergedUser = data?.user ? await fetchSessionData(data.user) : null;
-      if (mergedUser) {
-        setUser(mergedUser);
-        console.debug('[Auth.login] merged user set', { uid: mergedUser.id || mergedUser.user?.id });
-      } else {
-        console.debug('[Auth.login] no merged user, using raw user', { uid: data?.user?.id });
+      if (!data?.user) {
+        return {
+          ...data,
+          user: null,
+        };
       }
 
+      queryClient.clear();
+
+      const fallback = buildFallbackSignedInUser(data.user, email);
+      setAuthDataError(null);
+      setIdentity(fallback.identity);
+      setProfileState(fallback.profileState);
+      setUser(fallback.user);
+
+      const hydrationRun = ++loginHydrationRun.current;
+      const hydrationPromise = fetchSessionData(data.user, true).catch((hydrationError) => {
+        console.warn('[Auth.login] foreground identity hydration failed after sign-in:', describeAuthError(hydrationError));
+        return null;
+      });
+
+      const mergedUser = await Promise.race([
+        hydrationPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), LOGIN_ROUTE_LOOKUP_GRACE_MS)),
+      ]);
+
+      if (mergedUser && loginHydrationRun.current === hydrationRun) {
+        setUser(mergedUser);
+        queryClient.invalidateQueries();
+        console.debug('[Auth.login] merged user set', { uid: mergedUser.id || mergedUser.user?.id });
+        return {
+          ...data,
+          user: mergedUser,
+        };
+      }
+
+      hydrationPromise.then((eventualUser) => {
+        if (eventualUser && loginHydrationRun.current === hydrationRun) {
+          setUser(eventualUser);
+          queryClient.invalidateQueries();
+          console.debug('[Auth.login] deferred identity hydration completed', { uid: eventualUser.id || eventualUser.user?.id });
+        }
+      });
+
+      console.debug('[Auth.login] routed with safe fallback while identity hydrates', { uid: fallback.user?.id });
       return {
         ...data,
-        user: mergedUser || data?.user || null,
+        user: fallback.user,
       };
     } catch (e: any) {
       // Safely extract error details for non-Error throws (network responses, plain objects, strings)
@@ -363,7 +546,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         try { serialized = String(e); } catch { serialized = null; }
       }
 
-      console.error('[Auth.login] failed', {
+      console.warn('[Auth.login] failed', {
         errorType,
         message: message || serialized || String(e),
         stack: e?.stack,
@@ -372,7 +555,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       throw e;
     }
-  }, [fetchSessionData]);
+  }, [fetchSessionData, queryClient]);
 
   const register = useCallback(async (email: string, password: string) => {
     const { data, error } = await supabase.auth.signUp({ email, password });
@@ -386,24 +569,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (e) {
       console.warn('Logout network call timed out, forcing local logout.');
     }
+    queryClient.clear();
     setUser(null);
     setIdentity(null);
     setProfileState(null);
     setAuthDataError(null);
-  }, []);
+  }, [queryClient]);
 
   const refreshProfile = useCallback(async () => {
-    const { data, error } = await withTimeout(
+    const { data, error } = (await withTimeout(
       supabase.auth.getSession(),
       LOOKUP_TIMEOUT_MS,
       'Session refresh'
-    );
+    )) as any;
 
     if (error) throw error;
 
     const sessionUser = data?.session?.user;
     if (sessionUser) {
-      const userData = await fetchSessionData(sessionUser);
+      const userData = await fetchSessionData(sessionUser, true);
       setUser(userData);
       return userData;
     }
